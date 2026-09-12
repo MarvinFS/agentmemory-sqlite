@@ -1,0 +1,515 @@
+import type {
+  GraphNode,
+  GraphEdge,
+  Session,
+  CompressedObservation,
+} from "../types.js";
+import { KV } from "../state/schema.js";
+import type { StateKV } from "../state/kv.js";
+import {
+  GraphIndexReader,
+  graphReadable,
+  loadNameCatalog,
+  loadNodeIdsForObservations,
+} from "../state/graph-indexes.js";
+
+export interface GraphRetrievalResult {
+  obsId: string;
+  sessionId: string;
+  score: number;
+  graphContext: string;
+  pathLength: number;
+}
+
+type NeighborProvider = (
+  nodeId: string,
+) => Promise<Array<{ node: GraphNode; edge: GraphEdge }>>;
+
+function buildGraphContext(
+  path: Array<{ node: GraphNode; edge?: GraphEdge }>,
+): string {
+  const parts: string[] = [];
+  for (const step of path) {
+    const props = Object.entries(step.node.properties)
+      .slice(0, 3)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(", ");
+    let line = `[${step.node.type}] ${step.node.name}`;
+    if (props) line += ` (${props})`;
+    if (step.edge) {
+      line += ` --${step.edge.type}-->`;
+      if (step.edge.context?.reasoning) {
+        line += ` [${step.edge.context.reasoning}]`;
+      }
+      if (step.edge.tvalid) {
+        line += ` @${step.edge.tvalid}`;
+      }
+    }
+    parts.push(line);
+  }
+  return parts.join(" ");
+}
+
+export class GraphRetrieval {
+  constructor(private kv: StateKV) {}
+
+  /**
+   * Resolve each result to the session whose KV namespace actually holds
+   * its observation, so HybridSearch.enrichResults can load it via
+   * KV.observations(sessionId) (#656).
+   *
+   * The node-provided `sessionId` is only a hint: a node accumulates
+   * sourceObservationIds across many extracts/sessions but stores a single
+   * (most-recent) session, and legacy pre-#656 nodes store none. So for
+   * every result we VERIFY the obsId actually lives in the hinted session;
+   * on a miss (wrong hint, empty hint, multi-session node) we fall back to
+   * scanning known sessions. This makes the resolution authoritative
+   * rather than trusting a hint that can be stale or shared.
+   *
+   * Cost: the common single-session node confirms in one lookup. Results
+   * sharing an obsId are cached, so repeats are free. Only genuine misses
+   * pay the per-session scan.
+   */
+  private async resolveSessionIds(
+    results: GraphRetrievalResult[],
+  ): Promise<void> {
+    if (results.length === 0) return;
+
+    // obsId -> owning sessionId, or null when no known session holds it
+    // (so an unresolved obsId is scanned at most once, not per result).
+    const resolved = new Map<string, string | null>();
+    let sessions: Session[] | null = null; // lazily listed on first miss
+
+    const probe = async (sessionId: string, obsId: string): Promise<boolean> => {
+      const obs = await this.kv
+        .get<CompressedObservation>(KV.observations(sessionId), obsId)
+        .catch(() => null);
+      return obs !== null;
+    };
+
+    for (const r of results) {
+      if (resolved.has(r.obsId)) {
+        r.sessionId = resolved.get(r.obsId) ?? "";
+        continue;
+      }
+
+      // 1) Trust-but-verify the node's hint first (cheapest path).
+      if (r.sessionId && (await probe(r.sessionId, r.obsId))) {
+        resolved.set(r.obsId, r.sessionId);
+        continue;
+      }
+
+      // 2) Hint was empty or wrong — scan known sessions for the obs.
+      // Guard the list like probe() guards its get(): a KV failure here
+      // should degrade to an unresolved sessionId ("") for this obs, not
+      // abort the whole retrieval. Empty array also caches the miss below.
+      //
+      // NOTE: the graph-read-fix plan's delta 2 replaces this scan with a
+      // fail-closed miss once delta 3 (forward (sessionId, obsId) pair
+      // maintenance + legacy backfill) guarantees every node carries a
+      // correct hint. That is A-mode-only work, deferred with the backfill;
+      // until it lands the scan stays so A-mode never drops legacy nodes.
+      if (sessions === null) {
+        sessions = await this.kv
+          .list<Session>(KV.sessions)
+          .catch(() => [] as Session[]);
+      }
+      let found: string | null = null;
+      for (const session of sessions) {
+        if (session.id === r.sessionId) continue; // already probed above
+        if (await probe(session.id, r.obsId)) {
+          found = session.id;
+          break;
+        }
+      }
+      resolved.set(r.obsId, found);
+      r.sessionId = found ?? "";
+    }
+  }
+
+  async searchByEntities(
+    entityNames: string[],
+    maxDepth = 2,
+    maxResults = 20,
+  ): Promise<GraphRetrievalResult[]> {
+    if (await graphReadable(this.kv)) {
+      const reader = await GraphIndexReader.open(this.kv);
+      const catalog = await loadNameCatalog(this.kv);
+      const lowered = entityNames.map((e) => e.toLowerCase());
+      const matchingNodes: GraphNode[] = [];
+      for (const entry of catalog) {
+        const nameLower = entry.name.toLowerCase();
+        const matched = lowered.some(
+          (e) => nameLower.includes(e) || e.includes(nameLower),
+        );
+        if (!matched) continue;
+        const node = await reader.getNode(entry.id);
+        if (node) matchingNodes.push(node);
+      }
+      return this.scoreEntityMatches(
+        matchingNodes,
+        (id) => reader.getNeighbors(id),
+        maxDepth,
+        maxResults,
+      );
+    }
+
+    // Fail-closed: leg off or side-indexes unarmed. NEVER enumerate the
+    // graph scope here (that path is the uncatchable engine kill). Degrade
+    // to no graph contribution; smart_search still returns BM25+vector.
+    return [];
+  }
+
+  private async scoreEntityMatches(
+    matchingNodes: GraphNode[],
+    getNeighbors: NeighborProvider,
+    maxDepth: number,
+    maxResults: number,
+  ): Promise<GraphRetrievalResult[]> {
+    if (matchingNodes.length === 0) return [];
+
+    // Which start node first claims an observation decides its score,
+    // so iterate in a deterministic order regardless of whether the
+    // matches came from enumeration or the sharded name catalog.
+    const orderedMatches = [...matchingNodes].sort((a, b) =>
+      a.id.localeCompare(b.id),
+    );
+
+    const results: GraphRetrievalResult[] = [];
+    const visitedObs = new Set<string>();
+
+    for (const startNode of orderedMatches) {
+      const paths = await this.dijkstraTraversal(
+        startNode,
+        getNeighbors,
+        maxDepth,
+      );
+
+      for (const path of paths) {
+        const lastNode = path[path.length - 1].node;
+        for (const obsId of lastNode.sourceObservationIds) {
+          if (visitedObs.has(obsId)) continue;
+          visitedObs.add(obsId);
+
+          const pathLength = path.length;
+          const edgeWeights = path
+            .filter((s) => s.edge)
+            .map((s) => s.edge!.weight);
+          const avgWeight =
+            edgeWeights.length > 0
+              ? edgeWeights.reduce((a, b) => a + b, 0) / edgeWeights.length
+              : 0.5;
+          const score = avgWeight * (1 / pathLength);
+
+          results.push({
+            obsId,
+            sessionId: lastNode.sessionId ?? "",
+            score,
+            graphContext: buildGraphContext(path),
+            pathLength,
+          });
+        }
+      }
+
+      for (const obsId of startNode.sourceObservationIds) {
+        if (visitedObs.has(obsId)) continue;
+        visitedObs.add(obsId);
+        results.push({
+          obsId,
+          sessionId: startNode.sessionId ?? "",
+          score: 1.0,
+          graphContext: `[${startNode.type}] ${startNode.name}`,
+          pathLength: 0,
+        });
+      }
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    const top = results.slice(0, maxResults);
+    // Resolve sessions only for the surviving top-K so verification/scan
+    // work never runs for results that get trimmed away.
+    await this.resolveSessionIds(top);
+    return top;
+  }
+
+  async expandFromChunks(
+    obsIds: string[],
+    maxDepth = 1,
+    maxResults = 10,
+  ): Promise<GraphRetrievalResult[]> {
+    if (await graphReadable(this.kv)) {
+      const reader = await GraphIndexReader.open(this.kv);
+      const candidateIds = await loadNodeIdsForObservations(this.kv, obsIds);
+      const linkedNodes: GraphNode[] = [];
+      for (const nodeId of candidateIds) {
+        const node = await reader.getNode(nodeId);
+        if (
+          node &&
+          (node.sourceObservationIds ?? []).some((id) => obsIds.includes(id))
+        ) {
+          linkedNodes.push(node);
+        }
+      }
+      return this.scoreExpansion(
+        linkedNodes,
+        (id) => reader.getNeighbors(id),
+        obsIds,
+        maxDepth,
+        maxResults,
+      );
+    }
+
+    // Fail-closed: leg off or side-indexes unarmed. Never enumerate.
+    return [];
+  }
+
+  private async scoreExpansion(
+    linkedNodes: GraphNode[],
+    getNeighbors: NeighborProvider,
+    obsIds: string[],
+    maxDepth: number,
+    maxResults: number,
+  ): Promise<GraphRetrievalResult[]> {
+    const orderedLinked = [...linkedNodes].sort((a, b) =>
+      a.id.localeCompare(b.id),
+    );
+
+    const results: GraphRetrievalResult[] = [];
+    const visitedObs = new Set<string>(obsIds);
+
+    for (const node of orderedLinked) {
+      const paths = await this.dijkstraTraversal(node, getNeighbors, maxDepth);
+      for (const path of paths) {
+        const lastNode = path[path.length - 1].node;
+        for (const obsId of lastNode.sourceObservationIds) {
+          if (visitedObs.has(obsId)) continue;
+          visitedObs.add(obsId);
+
+          const pathLength = path.length;
+          const score = 0.5 * (1 / (pathLength + 1));
+
+          results.push({
+            obsId,
+            sessionId: lastNode.sessionId ?? "",
+            score,
+            graphContext: buildGraphContext(path),
+            pathLength,
+          });
+        }
+      }
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    const top = results.slice(0, maxResults);
+    await this.resolveSessionIds(top);
+    return top;
+  }
+
+  async temporalQuery(
+    entityName: string,
+    asOf?: string,
+  ): Promise<{
+    entity: GraphNode | null;
+    currentState: GraphEdge[];
+    history: GraphEdge[];
+  }> {
+    if (await graphReadable(this.kv)) {
+      const reader = await GraphIndexReader.open(this.kv);
+      const catalog = await loadNameCatalog(this.kv);
+      const lower = entityName.toLowerCase();
+      let entity: GraphNode | null = null;
+      for (const entry of catalog) {
+        if (entry.name.toLowerCase() !== lower) continue;
+        const node = await reader.getNode(entry.id);
+        if (node) {
+          entity = node;
+          break;
+        }
+      }
+      if (!entity) return { entity: null, currentState: [], history: [] };
+
+      const relatedEdges = await reader.getIncidentEdges(entity.id);
+      return this.partitionTemporalEdges(entity, relatedEdges, asOf);
+    }
+
+    // Fail-closed: leg off or side-indexes unarmed. Never enumerate.
+    return { entity: null, currentState: [], history: [] };
+  }
+
+  private partitionTemporalEdges(
+    entity: GraphNode,
+    relatedEdges: GraphEdge[],
+    asOf?: string,
+  ): {
+    entity: GraphNode | null;
+    currentState: GraphEdge[];
+    history: GraphEdge[];
+  } {
+    if (!asOf) {
+      const latestEdges = this.getLatestEdges(relatedEdges);
+      const historicalEdges = relatedEdges.filter(
+        (e) => !latestEdges.some((le) => le.id === e.id),
+      );
+      return { entity, currentState: latestEdges, history: historicalEdges };
+    }
+
+    const asOfDate = new Date(asOf).getTime();
+    const validEdges = relatedEdges.filter((e) => {
+      const commitDate = new Date(e.tcommit || e.createdAt).getTime();
+      if (commitDate > asOfDate) return false;
+      if (e.tvalid) {
+        const validDate = new Date(e.tvalid).getTime();
+        if (validDate > asOfDate) return false;
+      }
+      if (e.tvalidEnd) {
+        const endDate = new Date(e.tvalidEnd).getTime();
+        if (endDate < asOfDate) return false;
+      }
+      return true;
+    });
+
+    return {
+      entity,
+      currentState: this.getLatestEdges(validEdges),
+      history: validEdges,
+    };
+  }
+
+  private getLatestEdges(edges: GraphEdge[]): GraphEdge[] {
+    const byKey = new Map<string, GraphEdge[]>();
+    for (const e of edges) {
+      const key = `${e.sourceNodeId}|${e.targetNodeId}|${e.type}`;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key)!.push(e);
+    }
+
+    const latest: GraphEdge[] = [];
+    for (const group of byKey.values()) {
+      if (group.length === 0) continue;
+      group.sort(
+        (a, b) =>
+          new Date(b.tcommit || b.createdAt).getTime() -
+          new Date(a.tcommit || a.createdAt).getTime(),
+      );
+      const newest = group.find((e) => e.isLatest !== false) || group[0];
+      latest.push(newest);
+    }
+    return latest;
+  }
+
+  // Weighted shortest-path traversal (#328). Replaces the prior BFS,
+  // which fell back to edge-count order and ignored the 0.1-1.0 weight
+  // attached to every graph edge. Dijkstra over `cost = 1/weight`
+  // (cheaper edges = stronger relationships) returns the
+  // highest-weighted path to each reachable node within maxDepth.
+  // Neighbor expansion is delegated to the provider so the same
+  // traversal serves both the enumeration fallback (prebuilt adjacency
+  // over kv.list arrays) and the side-index path (targeted adjacency
+  // gets bounded by degree x maxDepth).
+  private async dijkstraTraversal(
+    startNode: GraphNode,
+    getNeighbors: NeighborProvider,
+    maxDepth: number,
+  ): Promise<Array<Array<{ node: GraphNode; edge?: GraphEdge }>>> {
+    const dist = new Map<string, number>();
+    const pathTo = new Map<string, Array<{ node: GraphNode; edge?: GraphEdge }>>();
+    dist.set(startNode.id, 0);
+    pathTo.set(startNode.id, [{ node: startNode }]);
+
+    const heap = new MinHeap<{ nodeId: string; depth: number; cost: number }>(
+      (a, b) => a.cost - b.cost,
+    );
+    heap.push({ nodeId: startNode.id, depth: 0, cost: 0 });
+
+    while (heap.size() > 0) {
+      const { nodeId, depth, cost } = heap.pop()!;
+      // Skip stale heap entries (cost beaten by a later push).
+      if (cost > (dist.get(nodeId) ?? Infinity)) continue;
+      if (depth >= maxDepth) continue;
+
+      const neighbors = await getNeighbors(nodeId);
+      for (const { node: nextNode, edge } of neighbors) {
+        const neighborId = nextNode.id;
+        // Clamp weight to avoid division-by-zero on malformed edges;
+        // 0.01 is below the documented 0.1 floor.
+        const edgeCost = 1 / Math.max(edge.weight, 0.01);
+        const newCost = cost + edgeCost;
+        if (newCost < (dist.get(neighborId) ?? Infinity)) {
+          dist.set(neighborId, newCost);
+          pathTo.set(neighborId, [
+            ...pathTo.get(nodeId)!,
+            { node: nextNode, edge },
+          ]);
+          heap.push({ nodeId: neighborId, depth: depth + 1, cost: newCost });
+        }
+      }
+    }
+
+    // Drop the startNode's own entry before returning: callers
+    // (searchByEntities, expandFromChunks) score start-node
+    // observations via a dedicated fallback loop with score=1.0. If
+    // we leave it in here, the start-path (length 1, no edges) goes
+    // through the generic path-scoring loop first — pathLength=1 +
+    // empty edgeWeights makes avgWeight fall to 0.5, the obs get
+    // marked visited, and the score=1.0 fallback becomes dead code.
+    pathTo.delete(startNode.id);
+    return Array.from(pathTo.values());
+  }
+}
+
+// Minimal binary min-heap. Pulled inline so graph-retrieval doesn't
+// take a new dependency for the perf-critical inner loop of #328.
+// Comparator returns negative when `a` should pop before `b`.
+class MinHeap<T> {
+  private heap: T[] = [];
+
+  constructor(private compare: (a: T, b: T) => number) {}
+
+  size(): number {
+    return this.heap.length;
+  }
+
+  push(value: T): void {
+    this.heap.push(value);
+    this.bubbleUp(this.heap.length - 1);
+  }
+
+  pop(): T | undefined {
+    if (this.heap.length === 0) return undefined;
+    const top = this.heap[0];
+    const last = this.heap.pop()!;
+    if (this.heap.length > 0) {
+      this.heap[0] = last;
+      this.sinkDown(0);
+    }
+    return top;
+  }
+
+  private bubbleUp(i: number): void {
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (this.compare(this.heap[i], this.heap[parent]) < 0) {
+        [this.heap[i], this.heap[parent]] = [this.heap[parent], this.heap[i]];
+        i = parent;
+      } else break;
+    }
+  }
+
+  private sinkDown(i: number): void {
+    const n = this.heap.length;
+    while (true) {
+      const left = 2 * i + 1;
+      const right = 2 * i + 2;
+      let smallest = i;
+      if (left < n && this.compare(this.heap[left], this.heap[smallest]) < 0) {
+        smallest = left;
+      }
+      if (right < n && this.compare(this.heap[right], this.heap[smallest]) < 0) {
+        smallest = right;
+      }
+      if (smallest === i) break;
+      [this.heap[i], this.heap[smallest]] = [this.heap[smallest], this.heap[i]];
+      i = smallest;
+    }
+  }
+}

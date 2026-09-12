@@ -1,0 +1,559 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
+import { backfillGraphIndexes } from "../src/state/graph-indexes.js";
+import type { GraphNode, GraphEdge } from "../src/types.js";
+
+// Build an in-memory KV. `arm` (default) builds the #893 side-indexes and
+// sets the readiness marker so the reader serves via the bounded index path
+// — the only path production readers take (graph-read-fix local delta: the
+// unarmed reader is fail-closed, it never enumerates). Pass arm:false to get
+// a raw store for the explicit fail-closed / kill-switch cases.
+async function mockKV(
+  nodes: GraphNode[] = [],
+  edges: GraphEdge[] = [],
+  arm = true,
+) {
+  const store = new Map<string, Map<string, unknown>>();
+  const nodesMap = new Map<string, unknown>();
+  for (const n of nodes) nodesMap.set(n.id, n);
+  store.set("mem:graph:nodes", nodesMap);
+
+  const edgesMap = new Map<string, unknown>();
+  for (const e of edges) edgesMap.set(e.id, e);
+  store.set("mem:graph:edges", edgesMap);
+
+  const listCalls = new Map<string, number>();
+  const kv = {
+    get: async <T>(scope: string, key: string): Promise<T | null> => {
+      return (store.get(scope)?.get(key) as T) ?? null;
+    },
+    set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, data);
+      return data;
+    },
+    delete: async (scope: string, key: string): Promise<void> => {
+      store.get(scope)?.delete(key);
+    },
+    list: async <T>(scope: string): Promise<T[]> => {
+      listCalls.set(scope, (listCalls.get(scope) ?? 0) + 1);
+      const entries = store.get(scope);
+      return entries ? (Array.from(entries.values()) as T[]) : [];
+    },
+    listCallCount: (scope?: string): number =>
+      scope
+        ? listCalls.get(scope) ?? 0
+        : [...listCalls.values()].reduce((a, b) => a + b, 0),
+  };
+  if (arm) await backfillGraphIndexes(kv as never, nodes, edges);
+  listCalls.clear(); // count only reads issued by the code under test
+  return kv;
+}
+
+function makeNode(
+  id: string,
+  name: string,
+  type: GraphNode["type"] = "concept",
+  obsIds: string[] = ["obs_1"],
+): GraphNode {
+  return {
+    id,
+    type,
+    name,
+    properties: {},
+    sourceObservationIds: obsIds,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function makeEdge(
+  id: string,
+  sourceNodeId: string,
+  targetNodeId: string,
+  type: GraphEdge["type"] = "related_to",
+  weight = 0.8,
+): GraphEdge {
+  return {
+    id,
+    type,
+    sourceNodeId,
+    targetNodeId,
+    weight,
+    sourceObservationIds: ["obs_1"],
+    createdAt: new Date().toISOString(),
+    tcommit: new Date().toISOString(),
+    isLatest: true,
+  };
+}
+
+describe("GraphRetrieval", () => {
+  it("finds entities by name", async () => {
+    const nodes = [
+      makeNode("n1", "React", "library", ["obs_1"]),
+      makeNode("n2", "Vue", "library", ["obs_2"]),
+    ];
+    const kv = await mockKV(nodes, []);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].obsId).toBe("obs_1");
+  });
+
+  it("finds entities by partial name match", async () => {
+    const nodes = [makeNode("n1", "auth-middleware", "function", ["obs_1"])];
+    const kv = await mockKV(nodes, []);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["auth"]);
+    expect(results.length).toBeGreaterThan(0);
+  });
+
+  it("traverses graph edges to find related observations", async () => {
+    const nodes = [
+      makeNode("n1", "React", "library", ["obs_1"]),
+      makeNode("n2", "Component", "concept", ["obs_2"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"], 2);
+    const obsIds = results.map((r) => r.obsId);
+    expect(obsIds).toContain("obs_1");
+    expect(obsIds).toContain("obs_2");
+  });
+
+  it("returns empty for no matches", async () => {
+    const kv = await mockKV([], []);
+    const retrieval = new GraphRetrieval(kv as never);
+    const results = await retrieval.searchByEntities(["nonexistent"]);
+    expect(results).toEqual([]);
+  });
+
+  it("expands from existing chunks", async () => {
+    const nodes = [
+      makeNode("n1", "auth.ts", "file", ["obs_1"]),
+      makeNode("n2", "jwt", "concept", ["obs_2"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.expandFromChunks(["obs_1"]);
+    const obsIds = results.map((r) => r.obsId);
+    expect(obsIds).toContain("obs_2");
+  });
+
+  it("does not duplicate already-seen observations in expansion", async () => {
+    const nodes = [makeNode("n1", "file.ts", "file", ["obs_1", "obs_2"])];
+    const kv = await mockKV(nodes, []);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.expandFromChunks(["obs_1"]);
+    const obsIds = results.map((r) => r.obsId);
+    expect(obsIds).not.toContain("obs_1");
+  });
+
+  it("performs temporal query - current state", async () => {
+    const nodes = [makeNode("n1", "Alice", "person", ["obs_1"])];
+    const edges = [
+      makeEdge("e1", "n1", "n1", "located_in" as any, 0.9),
+      {
+        ...makeEdge("e2", "n1", "n1", "located_in" as any, 0.9),
+        tvalid: "2024-06-01",
+        isLatest: true,
+      },
+    ];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const result = await retrieval.temporalQuery("Alice");
+    expect(result.entity).toBeDefined();
+    expect(result.entity!.name).toBe("Alice");
+    expect(result.currentState.length).toBeGreaterThan(0);
+  });
+
+  it("returns null entity for unknown name", async () => {
+    const kv = await mockKV([], []);
+    const retrieval = new GraphRetrieval(kv as never);
+    const result = await retrieval.temporalQuery("Unknown");
+    expect(result.entity).toBeNull();
+  });
+
+  it("scores closer paths higher", async () => {
+    const nodes = [
+      makeNode("n1", "React", "library", ["obs_1"]),
+      makeNode("n2", "Hook", "concept", ["obs_2"]),
+      makeNode("n3", "State", "concept", ["obs_3"]),
+    ];
+    const edges = [
+      makeEdge("e1", "n1", "n2", "uses", 0.9),
+      makeEdge("e2", "n2", "n3", "related_to", 0.8),
+    ];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"], 3);
+    const directScore = results.find((r) => r.obsId === "obs_1")?.score ?? 0;
+    const indirectScore = results.find((r) => r.obsId === "obs_3")?.score ?? 0;
+    expect(directScore).toBeGreaterThan(indirectScore);
+  });
+
+  // Dijkstra path selection (#328). The BFS implementation this
+  // replaced visited a node via its first-discovered path regardless
+  // of edge weight. Dijkstra picks the highest-weight (lowest
+  // 1/weight cost) path, so a one-hop weak edge no longer beats a
+  // two-hop chain of strong edges to the same node.
+  it("picks the weight-optimal path under Dijkstra, not the edge-count-shortest one (#328)", async () => {
+    const nodes = [
+      makeNode("n1", "Start", "concept", ["obs_start"]),
+      makeNode("n2", "Mid", "concept", ["obs_mid"]),
+      makeNode("n3", "End", "concept", ["obs_end"]),
+    ];
+    const edges = [
+      // Direct n1 → n3 path with a weak edge. BFS would prefer this.
+      makeEdge("e_direct", "n1", "n3", "related_to", 0.15),
+      // Two-hop chain n1 → n2 → n3 with strong edges. Total cost
+      // (1/0.9) + (1/0.9) ≈ 2.22, vs direct 1/0.15 ≈ 6.67.
+      // Dijkstra picks the chain.
+      makeEdge("e_strong_a", "n1", "n2", "related_to", 0.9),
+      makeEdge("e_strong_b", "n2", "n3", "related_to", 0.9),
+    ];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["Start"], 3);
+    const endResult = results.find((r) => r.obsId === "obs_end");
+    expect(endResult).toBeDefined();
+    // Path is [Start → Mid → End] (length 3) — Dijkstra picked the
+    // chain of two strong edges over the direct weak one.
+    expect(endResult!.pathLength).toBe(3);
+    expect(endResult!.graphContext).toContain("Mid");
+  });
+
+  it("handles disconnected nodes without crashing", async () => {
+    const nodes = [
+      makeNode("n1", "A", "concept", ["obs_a"]),
+      makeNode("n2", "B", "concept", ["obs_b"]),
+      // n3 is unreachable from the matched node.
+      makeNode("n3", "Lonely", "concept", ["obs_lonely"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "related_to", 0.7)];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["A"], 5);
+    expect(results.find((r) => r.obsId === "obs_a")).toBeDefined();
+    expect(results.find((r) => r.obsId === "obs_b")).toBeDefined();
+    expect(results.find((r) => r.obsId === "obs_lonely")).toBeUndefined();
+  });
+
+  it("clamps near-zero edge weights without dividing by zero", async () => {
+    const nodes = [
+      makeNode("n1", "Anchor", "concept", ["obs_anchor"]),
+      makeNode("n2", "Weak", "concept", ["obs_weak"]),
+    ];
+    // weight: 0 is malformed but we shouldn't crash on it; the clamp
+    // floor at 0.01 means traversal completes with a very high cost
+    // rather than throwing or producing Infinity.
+    const edges = [makeEdge("e1", "n1", "n2", "related_to", 0)];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["Anchor"], 2);
+    const weak = results.find((r) => r.obsId === "obs_weak");
+    expect(weak).toBeDefined();
+    expect(Number.isFinite(weak!.score)).toBe(true);
+  });
+
+  it("scores startNode observations at 1.0 via the fallback path, not 0.5 via the path-scoring loop (#328 review)", async () => {
+    // Regression for a bug surfaced by inline review on #463: if the
+    // traversal includes a length-1 path for the startNode itself,
+    // the generic path-scoring loop in searchByEntities computes
+    // avgWeight=0.5 (empty edgeWeights → fallback) and pathLength=1,
+    // yielding score=0.5, then marks the obs as visited. The
+    // dedicated score=1.0 fallback loop for startNode obs is then
+    // skipped via the visitedObs guard — dead code.
+    const nodes = [
+      makeNode("n1", "React", "library", ["obs_root"]),
+      makeNode("n2", "Hook", "concept", ["obs_neighbor"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses", 0.8)];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"], 2);
+    const root = results.find((r) => r.obsId === "obs_root");
+    expect(root).toBeDefined();
+    expect(root!.score).toBe(1.0);
+    expect(root!.pathLength).toBe(0);
+  });
+
+  it("respects maxDepth bound (Dijkstra stops at edge-count depth)", async () => {
+    // Chain n1 -> n2 -> n3 -> n4. With maxDepth=2 we should reach n3
+    // but not n4 — edge-count semantics preserved from the old BFS.
+    const nodes = [
+      makeNode("n1", "Start", "concept", ["obs_1"]),
+      makeNode("n2", "Hop1", "concept", ["obs_2"]),
+      makeNode("n3", "Hop2", "concept", ["obs_3"]),
+      makeNode("n4", "Hop3", "concept", ["obs_4"]),
+    ];
+    const edges = [
+      makeEdge("e1", "n1", "n2", "related_to", 0.8),
+      makeEdge("e2", "n2", "n3", "related_to", 0.8),
+      makeEdge("e3", "n3", "n4", "related_to", 0.8),
+    ];
+    const kv = await mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["Start"], 2);
+    expect(results.find((r) => r.obsId === "obs_3")).toBeDefined();
+    expect(results.find((r) => r.obsId === "obs_4")).toBeUndefined();
+  });
+});
+
+// Regression coverage for #656: graph results carried sessionId: "" which
+// made HybridSearch.enrichResults look up KV.observations("") and silently
+// drop every graph-retrieved observation. Results must now resolve to the
+// session whose KV namespace actually holds the observation. The resolver
+// trusts-but-verifies the node's sessionId hint and falls back to a scan
+// when the hint is empty (legacy node) or wrong (multi-session node).
+describe("GraphRetrieval — sessionId resolution (#656)", () => {
+  // Mock that serves graph nodes/edges, the sessions list, AND per-session
+  // observation rows, so the resolver's verify + scan paths have real data.
+  async function mockKVWithSessions(
+    nodes: GraphNode[],
+    edges: GraphEdge[],
+    sessions: Array<{ id: string }>,
+    obsBySession: Record<string, string[]>,
+  ) {
+    const store = new Map<string, Map<string, unknown>>();
+    const nodesMap = new Map<string, unknown>();
+    for (const n of nodes) nodesMap.set(n.id, n);
+    store.set("mem:graph:nodes", nodesMap);
+    const edgesMap = new Map<string, unknown>();
+    for (const e of edges) edgesMap.set(e.id, e);
+    store.set("mem:graph:edges", edgesMap);
+
+    const sessionsMap = new Map<string, unknown>();
+    for (const s of sessions) sessionsMap.set(s.id, s);
+    store.set("mem:sessions", sessionsMap);
+
+    for (const [sid, obsIds] of Object.entries(obsBySession)) {
+      const obsMap = new Map<string, unknown>();
+      for (const oid of obsIds) obsMap.set(oid, { id: oid, sessionId: sid });
+      store.set(`mem:obs:${sid}`, obsMap);
+    }
+
+    const listCalls = new Map<string, number>();
+    const kv = {
+      get: async <T>(scope: string, key: string): Promise<T | null> =>
+        (store.get(scope)?.get(key) as T) ?? null,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (!store.has(scope)) store.set(scope, new Map());
+        store.get(scope)!.set(key, data);
+        return data;
+      },
+      delete: async (scope: string, key: string): Promise<void> => {
+        store.get(scope)?.delete(key);
+      },
+      list: async <T>(scope: string): Promise<T[]> => {
+        listCalls.set(scope, (listCalls.get(scope) ?? 0) + 1);
+        const entries = store.get(scope);
+        return entries ? (Array.from(entries.values()) as T[]) : [];
+      },
+      listCallCount: (scope?: string): number =>
+        scope
+          ? listCalls.get(scope) ?? 0
+          : [...listCalls.values()].reduce((a, b) => a + b, 0),
+    };
+    await backfillGraphIndexes(kv as never, nodes, edges);
+    listCalls.clear(); // count only reads issued by the resolver
+    return kv;
+  }
+
+  it("resolves a node's sessionId when the hint is verified in KV (start-node path)", async () => {
+    const node: GraphNode = {
+      ...makeNode("n1", "React", "library", ["obs_1"]),
+      sessionId: "sess_abc",
+    };
+    const kv = await mockKVWithSessions([node], [], [{ id: "sess_abc" }], {
+      sess_abc: ["obs_1"],
+    });
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].obsId).toBe("obs_1");
+    // Before the fix this was always "" — the bug.
+    expect(results[0].sessionId).toBe("sess_abc");
+  });
+
+  it("resolves sessionId across a traversed path (last-node path)", async () => {
+    const nodes: GraphNode[] = [
+      { ...makeNode("n1", "React", "library", ["obs_1"]), sessionId: "sess_a" },
+      { ...makeNode("n2", "Hook", "concept", ["obs_2"]), sessionId: "sess_b" },
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = await mockKVWithSessions(
+      nodes,
+      edges,
+      [{ id: "sess_a" }, { id: "sess_b" }],
+      { sess_a: ["obs_1"], sess_b: ["obs_2"] },
+    );
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"], 2);
+    const hookResult = results.find((r) => r.obsId === "obs_2");
+    expect(hookResult).toBeDefined();
+    // obs_2 belongs to n2, whose session is sess_b.
+    expect(hookResult!.sessionId).toBe("sess_b");
+  });
+
+  it("resolves sessionId in expandFromChunks", async () => {
+    const nodes: GraphNode[] = [
+      { ...makeNode("n1", "auth.ts", "file", ["obs_1"]), sessionId: "sess_a" },
+      { ...makeNode("n2", "jwt", "concept", ["obs_2"]), sessionId: "sess_b" },
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = await mockKVWithSessions(
+      nodes,
+      edges,
+      [{ id: "sess_a" }, { id: "sess_b" }],
+      { sess_a: ["obs_1"], sess_b: ["obs_2"] },
+    );
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.expandFromChunks(["obs_1"]);
+    const jwtResult = results.find((r) => r.obsId === "obs_2");
+    expect(jwtResult).toBeDefined();
+    expect(jwtResult!.sessionId).toBe("sess_b");
+  });
+
+  it("backfills sessionId for legacy nodes (no sessionId field) via session scan", async () => {
+    // Legacy node written before #656 — no sessionId. The obs lives in
+    // sess_legacy; the scan fallback must locate it.
+    const node = makeNode("n1", "React", "library", ["obs_legacy"]);
+    expect(node.sessionId).toBeUndefined();
+    const kv = await mockKVWithSessions(
+      [node],
+      [],
+      [{ id: "sess_other" }, { id: "sess_legacy" }],
+      { sess_other: ["obs_unrelated"], sess_legacy: ["obs_legacy"] },
+    );
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
+    const r = results.find((x) => x.obsId === "obs_legacy");
+    expect(r).toBeDefined();
+    expect(r!.sessionId).toBe("sess_legacy");
+  });
+
+  it("corrects a stale hint for a multi-session node (verify-then-scan)", async () => {
+    // A node re-observed across two sessions accumulates both obsIds but
+    // stores only the most-recent session (sess_b). obs_a actually lives in
+    // sess_a — trusting the hint blindly would mis-namespace it and drop it
+    // at enrichment. The resolver must verify and re-locate obs_a to sess_a.
+    const node: GraphNode = {
+      ...makeNode("n1", "React", "library", ["obs_a", "obs_b"]),
+      sessionId: "sess_b",
+    };
+    const kv = await mockKVWithSessions(
+      [node],
+      [],
+      [{ id: "sess_a" }, { id: "sess_b" }],
+      { sess_a: ["obs_a"], sess_b: ["obs_b"] },
+    );
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
+    const ra = results.find((x) => x.obsId === "obs_a");
+    const rb = results.find((x) => x.obsId === "obs_b");
+    expect(ra).toBeDefined();
+    expect(rb).toBeDefined();
+    // obs_b matches the hint; obs_a is corrected to its true owning session.
+    expect(rb!.sessionId).toBe("sess_b");
+    expect(ra!.sessionId).toBe("sess_a");
+  });
+
+  it("leaves sessionId empty when an obs exists in no session", async () => {
+    const node = makeNode("n1", "React", "library", ["obs_orphan"]);
+    const kv = await mockKVWithSessions([node], [], [{ id: "sess_x" }], {
+      sess_x: ["obs_unrelated"],
+    });
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
+    const r = results.find((x) => x.obsId === "obs_orphan");
+    expect(r).toBeDefined();
+    // No session owns it — graceful empty, not a crash.
+    expect(r!.sessionId).toBe("");
+  });
+
+  it("degrades gracefully when the sessions list throws (no abort)", async () => {
+    // Legacy node (no sessionId hint) so resolution must hit the scan path.
+    const node = makeNode("n1", "React", "library", ["obs_1"]);
+    const kv = await mockKVWithSessions([node], [], [{ id: "sess_a" }], {
+      sess_a: ["obs_1"],
+    });
+    // Fail only the sessions list; node/edge lists still work so retrieval
+    // produces results. Resolution must fall back to an empty sessionId
+    // rather than rejecting the whole retrieval.
+    const originalList = kv.list;
+    kv.list = (async (scope: string) => {
+      if (scope === "mem:sessions") throw new Error("kv down");
+      return originalList(scope);
+    }) as never;
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
+    const r = results.find((x) => x.obsId === "obs_1");
+    expect(r).toBeDefined();
+    expect(r!.sessionId).toBe("");
+  });
+});
+
+// graph-read-fix local delta 1: the reader is fail-closed. It serves graph
+// results ONLY when the side-indexes are armed AND the leg is on. In every
+// other state it returns empty WITHOUT enumerating the graph scope — the
+// unarmed kv.list(KV.graph*) enumeration is the uncatchable engine kill that
+// 500s smart_search.
+describe("GraphRetrieval — fail-closed graph leg (delta 1)", () => {
+  const nodes = [makeNode("n1", "React", "library", ["obs_1"])];
+  const edges: GraphEdge[] = [];
+
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_GRAPH_LEG;
+  });
+
+  it("returns empty and never enumerates when the side-indexes are unarmed", async () => {
+    const kv = await mockKV(nodes, edges, /* arm */ false);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    expect(await retrieval.searchByEntities(["React"])).toEqual([]);
+    expect(await retrieval.expandFromChunks(["obs_1"])).toEqual([]);
+    expect((await retrieval.temporalQuery("React")).entity).toBeNull();
+    expect(kv.listCallCount("mem:graph:nodes")).toBe(0);
+    expect(kv.listCallCount("mem:graph:edges")).toBe(0);
+  });
+
+  it("kill-switch: AGENTMEMORY_GRAPH_LEG=off fails closed even when armed", async () => {
+    const kv = await mockKV(nodes, edges /* armed */);
+    process.env.AGENTMEMORY_GRAPH_LEG = "off";
+    const retrieval = new GraphRetrieval(kv as never);
+
+    expect(await retrieval.searchByEntities(["React"])).toEqual([]);
+    expect(await retrieval.expandFromChunks(["obs_1"])).toEqual([]);
+    expect((await retrieval.temporalQuery("React")).entity).toBeNull();
+    expect(kv.listCallCount("mem:graph:nodes")).toBe(0);
+    expect(kv.listCallCount("mem:graph:edges")).toBe(0);
+  });
+
+  it("serves results again once armed and the leg is on", async () => {
+    const kv = await mockKV(nodes, edges /* armed */);
+    const retrieval = new GraphRetrieval(kv as never);
+    const results = await retrieval.searchByEntities(["React"]);
+    expect(results.some((r) => r.obsId === "obs_1")).toBe(true);
+  });
+});

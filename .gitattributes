@@ -1,0 +1,11 @@
+# These files are scp'd to Linux hosts or baked into containers and are executed
+# there. core.autocrlf=true on a Windows checkout would hand them CRLF endings,
+# which bash rejects with "$'\r': command not found". Pin them to LF.
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+.githooks/* text eol=lf
+# scripts/skills/generate.ts --check compares bytes; a CRLF checkout would report DRIFT on every file.
+plugin/skills/*/REFERENCE.md text eol=lf
+# tsdown writes these tracked build outputs with LF; a CRLF checkout shows all of them modified after every build.
+plugin/scripts/*.mjs text eol=lf

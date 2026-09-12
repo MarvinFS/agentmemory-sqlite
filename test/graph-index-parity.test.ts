@@ -1,0 +1,406 @@
+import { describe, it, expect, vi } from "vitest";
+
+vi.mock("../src/logger.js", () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
+import { registerGraphFunction } from "../src/functions/graph.js";
+import {
+  backfillGraphIndexes,
+  graphIndexesReady,
+  indexGraphEdge,
+  indexGraphNode,
+  loadNameCatalog,
+} from "../src/state/graph-indexes.js";
+import type {
+  GraphNode,
+  GraphEdge,
+  GraphQueryResult,
+} from "../src/types.js";
+
+function mockKV(nodes: GraphNode[] = [], edges: GraphEdge[] = []) {
+  const store = new Map<string, Map<string, unknown>>();
+  const nodesMap = new Map<string, unknown>();
+  for (const n of nodes) nodesMap.set(n.id, n);
+  store.set("mem:graph:nodes", nodesMap);
+
+  const edgesMap = new Map<string, unknown>();
+  for (const e of edges) edgesMap.set(e.id, e);
+  store.set("mem:graph:edges", edgesMap);
+
+  const listCalls = new Map<string, number>();
+
+  return {
+    get: async <T>(scope: string, key: string): Promise<T | null> => {
+      return (store.get(scope)?.get(key) as T) ?? null;
+    },
+    set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, data);
+      return data;
+    },
+    delete: async (scope: string, key: string): Promise<void> => {
+      store.get(scope)?.delete(key);
+    },
+    list: async <T>(scope: string): Promise<T[]> => {
+      listCalls.set(scope, (listCalls.get(scope) ?? 0) + 1);
+      const entries = store.get(scope);
+      return entries ? (Array.from(entries.values()) as T[]) : [];
+    },
+    // Graph-scope enumeration count. Excludes the KV.sessions scan that
+    // #937's resolveSessionIds performs on a hint-miss — that is a separate
+    // (bounded, non-graph) concern; these tests guard the #893 property that
+    // the armed reader never enumerates the GRAPH scope.
+    listCallCount: () =>
+      (listCalls.get("mem:graph:nodes") ?? 0) +
+      (listCalls.get("mem:graph:edges") ?? 0),
+  };
+}
+
+function mockSdk() {
+  const functions = new Map<string, Function>();
+  return {
+    registerFunction: (
+      idOrOpts: string | { id: string },
+      handler: Function,
+    ) => {
+      const id = typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id;
+      functions.set(id, handler);
+    },
+    registerTrigger: () => {},
+    trigger: async (
+      idOrInput: string | { function_id: string; payload: unknown },
+      data?: unknown,
+    ) => {
+      const id =
+        typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
+      const payload = typeof idOrInput === "string" ? data : idOrInput.payload;
+      const fn = functions.get(id);
+      if (!fn) throw new Error(`No function: ${id}`);
+      return fn(payload);
+    },
+  };
+}
+
+const mockProvider = {
+  name: "test",
+  compress: vi.fn().mockResolvedValue(""),
+  summarize: vi.fn(),
+};
+
+function makeNode(
+  id: string,
+  name: string,
+  type: GraphNode["type"] = "concept",
+  obsIds: string[] = ["obs_1"],
+  properties: Record<string, unknown> = {},
+): GraphNode {
+  return {
+    id,
+    type,
+    name,
+    properties,
+    sourceObservationIds: obsIds,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function makeEdge(
+  id: string,
+  sourceNodeId: string,
+  targetNodeId: string,
+  type: GraphEdge["type"] = "related_to",
+  weight = 0.8,
+): GraphEdge {
+  return {
+    id,
+    type,
+    sourceNodeId,
+    targetNodeId,
+    weight,
+    sourceObservationIds: ["obs_1"],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    tcommit: "2026-01-01T00:00:00.000Z",
+    isLatest: true,
+  };
+}
+
+function fixtureGraph(): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  const nodes = [
+    makeNode("n1", "React", "library", ["obs_react"]),
+    makeNode("n2", "Hook", "concept", ["obs_hook"]),
+    makeNode("n3", "State", "concept", ["obs_state"]),
+    makeNode("n4", "auth-middleware", "function", ["obs_auth"]),
+    makeNode("n5", "Lonely", "concept", ["obs_lonely"]),
+  ];
+  const edges = [
+    makeEdge("e1", "n1", "n2", "uses", 0.9),
+    makeEdge("e2", "n2", "n3", "related_to", 0.8),
+    makeEdge("e3", "n1", "n3", "related_to", 0.15),
+    makeEdge("e4", "n4", "n1", "uses", 0.7),
+  ];
+  return { nodes, edges };
+}
+
+// Bulk arming: one backfillGraphIndexes pass over the whole corpus.
+async function indexedKV(nodes: GraphNode[], edges: GraphEdge[]) {
+  const kv = mockKV(nodes, edges);
+  await backfillGraphIndexes(kv as never, nodes, edges);
+  return kv;
+}
+
+// Incremental arming: the per-write index maintenance path (indexGraphNode /
+// indexGraphEdge) plus the readiness marker. The two arming paths must build
+// equivalent side-indexes — that is what these parity tests now assert, since
+// the old enumeration reference is removed (readers fail-closed when unarmed).
+async function incrementalKV(nodes: GraphNode[], edges: GraphEdge[]) {
+  const kv = mockKV(nodes, edges);
+  for (const node of nodes) await indexGraphNode(kv as never, node);
+  for (const edge of edges) await indexGraphEdge(kv as never, edge);
+  await kv.set("mem:graph:index-meta", "current", { version: 1 });
+  return kv;
+}
+
+function sortResults<T extends { obsId: string }>(results: T[]): T[] {
+  return [...results].sort((a, b) => a.obsId.localeCompare(b.obsId));
+}
+
+describe("graph index parity", () => {
+  it("searchByEntities returns identical results via bulk and incremental indexes", async () => {
+    const { nodes, edges } = fixtureGraph();
+    const plain = new GraphRetrieval((await incrementalKV(nodes, edges)) as never);
+    const indexed = new GraphRetrieval((await indexedKV(nodes, edges)) as never);
+
+    for (const query of [["React"], ["auth"], ["react", "state"], ["nope"]]) {
+      const viaList = sortResults(await plain.searchByEntities(query, 3, 20));
+      const viaIndex = sortResults(await indexed.searchByEntities(query, 3, 20));
+      expect(viaIndex).toEqual(viaList);
+    }
+  });
+
+  it("searchByEntities parity holds between bulk backfill and incremental writes", async () => {
+    const { nodes, edges } = fixtureGraph();
+    const plain = new GraphRetrieval((await indexedKV(nodes, edges)) as never);
+    const indexed = new GraphRetrieval((await incrementalKV(nodes, edges)) as never);
+
+    const viaList = sortResults(await plain.searchByEntities(["React"], 2));
+    const viaIndex = sortResults(await indexed.searchByEntities(["React"], 2));
+    expect(viaIndex).toEqual(viaList);
+  });
+
+  it("expandFromChunks returns identical results via bulk and incremental indexes", async () => {
+    const { nodes, edges } = fixtureGraph();
+    const plain = new GraphRetrieval((await incrementalKV(nodes, edges)) as never);
+    const indexed = new GraphRetrieval((await indexedKV(nodes, edges)) as never);
+
+    for (const obsIds of [["obs_react"], ["obs_hook", "obs_auth"], ["obs_x"]]) {
+      const viaList = sortResults(await plain.expandFromChunks(obsIds, 2, 20));
+      const viaIndex = sortResults(await indexed.expandFromChunks(obsIds, 2, 20));
+      expect(viaIndex).toEqual(viaList);
+    }
+  });
+
+  it("temporalQuery returns identical results via bulk and incremental indexes", async () => {
+    const nodes = [makeNode("n1", "Alice", "person", ["obs_1"])];
+    const edges = [
+      makeEdge("e1", "n1", "n1", "located_in" as never, 0.9),
+      {
+        ...makeEdge("e2", "n1", "n1", "located_in" as never, 0.9),
+        tcommit: "2026-02-01T00:00:00.000Z",
+        tvalid: "2026-02-01",
+        isLatest: true,
+      },
+    ];
+    const plain = new GraphRetrieval((await incrementalKV(nodes, edges)) as never);
+    const indexed = new GraphRetrieval((await indexedKV(nodes, edges)) as never);
+
+    for (const asOf of [undefined, "2026-01-15T00:00:00.000Z", "2026-03-01T00:00:00.000Z"]) {
+      const viaList = await plain.temporalQuery("Alice", asOf);
+      const viaIndex = await indexed.temporalQuery("Alice", asOf);
+      expect(viaIndex.entity?.id).toBe(viaList.entity?.id);
+      expect(sortResults(mapEdges(viaIndex.currentState))).toEqual(
+        sortResults(mapEdges(viaList.currentState)),
+      );
+      expect(sortResults(mapEdges(viaIndex.history))).toEqual(
+        sortResults(mapEdges(viaList.history)),
+      );
+    }
+
+    const missingViaIndex = await indexed.temporalQuery("Nobody");
+    expect(missingViaIndex.entity).toBeNull();
+
+    function mapEdges(list: GraphEdge[]) {
+      return list.map((e) => ({ obsId: e.id }));
+    }
+  });
+
+  it("graph-query startNodeId traversal returns identical pages via bulk and incremental indexes", async () => {
+    const { nodes, edges } = fixtureGraph();
+
+    const plainKv = await incrementalKV(nodes, edges);
+    const plainSdk = mockSdk();
+    registerGraphFunction(plainSdk as never, plainKv as never, mockProvider as never);
+
+    const idxKv = await indexedKV(nodes, edges);
+    const idxSdk = mockSdk();
+    registerGraphFunction(idxSdk as never, idxKv as never, mockProvider as never);
+
+    const viaList = (await plainSdk.trigger("mem::graph-query", {
+      startNodeId: "n1",
+      maxDepth: 2,
+    })) as GraphQueryResult;
+    const viaIndex = (await idxSdk.trigger("mem::graph-query", {
+      startNodeId: "n1",
+      maxDepth: 2,
+    })) as GraphQueryResult;
+
+    expect(viaIndex.nodes.map((n) => n.id).sort()).toEqual(
+      viaList.nodes.map((n) => n.id).sort(),
+    );
+    expect(viaIndex.edges.map((e) => e.id).sort()).toEqual(
+      viaList.edges.map((e) => e.id).sort(),
+    );
+    expect(viaIndex.totalNodes).toBe(viaList.totalNodes);
+    expect(viaIndex.totalEdges).toBe(viaList.totalEdges);
+    expect(viaIndex.truncated).toBe(viaList.truncated);
+  });
+
+  it("graph-query query branch matches name and property when the snapshot covers the corpus", async () => {
+    const nodes = [
+      makeNode("n1", "payments-service", "project", ["obs_1"], { lang: "rust" }),
+      makeNode("n2", "billing", "concept", ["obs_2"], { note: "uses payments" }),
+      makeNode("n3", "frontend", "project", ["obs_3"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "related_to", 0.9)];
+
+    const idxKv = mockKV(nodes, edges);
+    const idxSdk = mockSdk();
+    registerGraphFunction(idxSdk as never, idxKv as never, mockProvider as never);
+    await idxSdk.trigger("mem::graph-snapshot-rebuild", { force: true });
+    expect(await graphIndexesReady(idxKv as never)).toBe(true);
+
+    // Query branch matches by name (payments-service) AND property
+    // (billing's note "uses payments"), and returns no degradation warning
+    // when armed with a snapshot covering the corpus. (Property matching
+    // needs the snapshot, so this is a rebuild-armed assertion, not a
+    // bulk-vs-incremental parity — incremental arming builds no snapshot.)
+    const viaIndex = (await idxSdk.trigger("mem::graph-query", {
+      query: "payments",
+    })) as GraphQueryResult;
+
+    expect(viaIndex.nodes.map((n) => n.id).sort()).toEqual(["n1", "n2"]);
+    expect(viaIndex.edges.map((e) => e.id).sort()).toEqual(["e1"]);
+    expect(viaIndex.totalNodes).toBe(2);
+    expect(viaIndex.warning).toBeUndefined();
+  });
+
+  it("fails closed (never enumerates) when the readiness marker is absent", async () => {
+    // graph-read-fix local delta 1: the pre-#893 behaviour here was to fall
+    // back to a full kv.list enumeration — the uncatchable engine kill that
+    // 500s smart_search. The reader now returns empty WITHOUT any graph-scope
+    // list call.
+    const { nodes, edges } = fixtureGraph();
+    const kv = mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    expect(await retrieval.searchByEntities(["React"])).toEqual([]);
+    expect(await retrieval.expandFromChunks(["obs_react"])).toEqual([]);
+    expect((await retrieval.temporalQuery("React")).entity).toBeNull();
+    expect(kv.listCallCount()).toBe(0);
+  });
+
+  it("kill-switch: AGENTMEMORY_GRAPH_LEG=off fails closed even when armed", async () => {
+    const { nodes, edges } = fixtureGraph();
+    const kv = await indexedKV(nodes, edges);
+    const before = kv.listCallCount();
+    const retrieval = new GraphRetrieval(kv as never);
+    process.env.AGENTMEMORY_GRAPH_LEG = "off";
+    try {
+      expect(await retrieval.searchByEntities(["React"])).toEqual([]);
+      expect(await retrieval.expandFromChunks(["obs_react"])).toEqual([]);
+      expect((await retrieval.temporalQuery("React")).entity).toBeNull();
+      expect(kv.listCallCount()).toBe(before);
+    } finally {
+      delete process.env.AGENTMEMORY_GRAPH_LEG;
+    }
+  });
+
+  it("never enumerates when the readiness marker is present", async () => {
+    const { nodes, edges } = fixtureGraph();
+    const kv = await indexedKV(nodes, edges);
+    const before = kv.listCallCount();
+    const retrieval = new GraphRetrieval(kv as never);
+
+    await retrieval.searchByEntities(["React"]);
+    await retrieval.expandFromChunks(["obs_react"]);
+    await retrieval.temporalQuery("React");
+    expect(kv.listCallCount()).toBe(before);
+  });
+
+  it("graph-extract maintains the side-indexes after a rebuild", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="file" name="src/index.ts"/>
+<entity type="function" name="main"/>
+</entities>
+<relationships>
+<relationship type="uses" source="src/index.ts" target="main" weight="0.9"/>
+</relationships>`);
+
+    // Fork: graph writes need the extraction flag (see graphWritesDisabled).
+    const origFlag = process.env["GRAPH_EXTRACTION_ENABLED"];
+    process.env["GRAPH_EXTRACTION_ENABLED"] = "true";
+    try {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+    await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [
+        {
+          id: "obs_new",
+          sessionId: "ses_1",
+          timestamp: "2026-02-01T10:00:00Z",
+          type: "file_edit",
+          title: "Edit index file",
+          facts: [],
+          narrative: "Updated index.ts",
+          concepts: [],
+          files: ["src/index.ts"],
+          importance: 7,
+        },
+      ],
+    });
+
+    const catalog = await loadNameCatalog(kv as never);
+    expect(catalog.map((c) => c.name).sort()).toEqual(["main", "src/index.ts"]);
+
+    const before = kv.listCallCount();
+    const retrieval = new GraphRetrieval(kv as never);
+    const results = await retrieval.searchByEntities(["index"]);
+    expect(results.some((r) => r.obsId === "obs_new")).toBe(true);
+    expect(kv.listCallCount()).toBe(before);
+    } finally {
+      if (origFlag === undefined) delete process.env["GRAPH_EXTRACTION_ENABLED"];
+      else process.env["GRAPH_EXTRACTION_ENABLED"] = origFlag;
+    }
+  });
+
+  it("graph-reset stops indexed retrieval from serving pre-reset rows", async () => {
+    const { nodes, edges } = fixtureGraph();
+    const kv = await indexedKV(nodes, edges);
+    const sdk = mockSdk();
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+
+    const retrieval = new GraphRetrieval(kv as never);
+    expect((await retrieval.searchByEntities(["React"])).length).toBeGreaterThan(0);
+
+    await sdk.trigger("mem::graph-reset", {});
+
+    expect(await retrieval.searchByEntities(["React"])).toEqual([]);
+    expect(await retrieval.expandFromChunks(["obs_react"])).toEqual([]);
+    expect((await retrieval.temporalQuery("React")).entity).toBeNull();
+    expect(kv.listCallCount()).toBe(0);
+  });
+});

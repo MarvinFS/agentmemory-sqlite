@@ -1,0 +1,18 @@
+#!/bin/sh
+# Local replacement for CI. There are no GitHub Actions on this repo (disabled at
+# the repo level), so these are the only automated checks that run. Activate once
+# per clone:
+#   git config core.hooksPath .githooks
+# Only the checks that pass on a Windows checkout run here. `npm test` is not one
+# of them: the suite has Windows-only failures (hardcoded /tmp paths, symlink
+# checks, HOME vs USERPROFILE), so run it on Linux.
+set -e
+# This fork is shared, so nothing private may reach the remote. The scanner is
+# local-only and gitignored, so a fresh clone simply skips this step.
+if [ -f scripts/check-private.sh ]; then
+	sh scripts/check-private.sh
+fi
+# Windows npm runs scripts in cmd.exe, which cannot parse the POSIX build chain.
+export npm_config_script_shell="$(command -v bash)"
+npm run build
+npm run skills:check
